@@ -1,1 +1,302 @@
+<!doctype html>
+<html lang="pt">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consumo Diário — Shelly (Gen2)</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:820px;margin:24px auto;padding:0 12px}
+  header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  h1{margin:0;font-size:1.4rem}
+  .card{border:1px solid #ddd;border-radius:10px;padding:14px;margin:12px 0}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row > *{flex:1 1 200px}
+  label{display:block;font-size:.9rem;margin:.3rem 0}
+  input,select,button{width:100%;padding:8px;border:1px solid #bbb;border-radius:8px}
+  button{cursor:pointer}
+  .kpis{display:flex;gap:10px;flex-wrap:wrap}
+  .kpi{flex:1 1 150px;border:1px solid #eee;border-radius:10px;padding:10px}
+  .muted{color:#666}
+</style>
+<body>
+<header>
+  <h1>Consumo Diário — Shelly (Gen2)</h1>
+  <div class="muted" id="appVersion"></div>
+</header>
+
+<div class="card">
+  <h3>Configuração</h3>
+  <div class="row">
+    <div>
+      <label>Modo</label>
+      <select id="mode">
+        <option value="cloud">CLOUD (proxy HTTPS, recomendado p/ GitHub Pages)</option>
+        <option value="local">LOCAL (LAN via RPC/CSV — abrir site por http)</option>
+        <option value="demo">DEMO</option>
+      </select>
+    </div>
+    <div id="cloudBox">
+      <label>Endpoint HTTPS (Worker/Function)</label>
+      <input id="cloudUrl" placeholder="https://example.com/api/shelly/daily?date=YYYY-MM-DD">
+      <small class="muted">Devolve JSON com {kwh,minW,avgW,maxW,peakAt}.</small>
+    </div>
+    <div id="localBox" style="display:none">
+      <label>IP do Shelly (LAN)</label>
+      <input id="shellyIp" placeholder="192.168.1.50">
+      <small class="muted">Suporta EMData (3EM, etc.) e EM1Data (Pro EM-50 com 2 canais).</small>
+    </div>
+  </div>
+  <div class="row">
+    <button id="saveCfg">Guardar</button>
+    <button id="pullToday">Atualizar hoje</button>
+    <button id="markDone">Marcar dia como concluído</button>
+    <button id="reset">Repor</button>
+  </div>
+  <small id="cfgHint" class="muted"></small>
+</div>
+
+<div class="card">
+  <h3>Resumo de hoje (<span id="todayLabel"></span>)</h3>
+  <div class="kpis">
+    <div class="kpi"><div class="muted">Energia</div><div id="kpiKwh" style="font-size:1.4rem">— kWh</div></div>
+    <div class="kpi"><div class="muted">Pico</div><div id="kpiPico">— W</div></div>
+    <div class="kpi"><div class="muted">Média</div><div id="kpiAvg">— W</div></div>
+    <div class="kpi"><div class="muted">Load factor</div><div id="kpiLF">—</div></div>
+  </div>
+  <small class="muted" id="todayNote"></small>
+</div>
+
+<div class="card">
+  <h3>Relatórios</h3>
+  <canvas id="chartDaily" height="200"></canvas>
+  <br>
+  <canvas id="chartWeekly" height="200"></canvas>
+</div>
+
+<div class="card">
+  <h3>Histórico</h3>
+  <div id="history"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const APP_VERSION = "v2025.09.06-onefile";
+const LS_KEY_CFG = "shelly_cfg";
+const LS_KEY_DATA = "shelly_data";
+
+const $ = s => document.querySelector(s);
+const isoToday = () => new Date().toISOString().slice(0,10);
+
+function loadCfg(){ try{return JSON.parse(localStorage.getItem(LS_KEY_CFG)||"{}");}catch{return{}} }
+function saveCfg(c){ localStorage.setItem(LS_KEY_CFG, JSON.stringify(c)); }
+function loadDb(){ try{return JSON.parse(localStorage.getItem(LS_KEY_DATA)||"{}");}catch{return{}} }
+function saveDb(db){ localStorage.setItem(LS_KEY_DATA, JSON.stringify(db)); }
+
+function uiFromCfg(){
+  const cfg = loadCfg();
+  $("#mode").value = cfg.mode || "cloud";
+  $("#cloudUrl").value = cfg.cloudUrl || "";
+  $("#shellyIp").value = cfg.shellyIp || "";
+  $("#cloudBox").style.display = (cfg.mode==="cloud")?"block":"none";
+  $("#localBox").style.display = (cfg.mode==="local")?"block":"none";
+  $("#cfgHint").textContent = (cfg.mode==="cloud")
+    ? "Funciona em GitHub Pages (HTTPS) via proxy."
+    : (cfg.mode==="local" ? "Abre esta página via http e está na mesma LAN do Shelly."
+    : "Valores sintéticos para teste.");
+}
+
+async function pullDay(dateISO){
+  const cfg = loadCfg();
+  let day;
+  if ((cfg.mode||"cloud")==="cloud") day = await fetchCloud(dateISO);
+  else if (cfg.mode==="local") day = await fetchLocal(dateISO);
+  else day = demoDay(dateISO);
+
+  const db = loadDb();
+  db[dateISO] = Object.assign(db[dateISO]||{}, day);
+  saveDb(db);
+  render();
+}
+
+async function fetchCloud(dateISO){
+  const url = loadCfg().cloudUrl;
+  if (!url) throw new Error("Configura o endpoint HTTPS em Configuração.");
+  const u = new URL(url);
+  if (u.searchParams.has("date")) u.searchParams.set("date", dateISO);
+  const r = await fetch(u.toString(), {cache:"no-store"});
+  if (!r.ok) throw new Error("Falha no endpoint cloud");
+  return await r.json();
+}
+
+async function fetchLocal(dateISO){
+  const ip = loadCfg().shellyIp;
+  if (!ip) throw new Error("Define o IP do Shelly.");
+  const t0 = Math.floor(new Date(dateISO+"T00:00:00").getTime()/1000);
+  const t1 = t0 + 86399;
+
+  const probe = await (await fetch(`http://${ip}/rpc/Shelly.GetStatus`)).json();
+  const hasEMData  = Object.keys(probe).some(k=>k.startsWith("emdata:"));
+  const hasEM1Data = Object.keys(probe).some(k=>k.startsWith("em1data:"));
+
+  if (hasEMData)  return await readViaEMData(ip, t0, t1);
+  if (hasEM1Data) return await readViaEM1Data(ip, t0, t1);
+
+  const p = probe["switch:0"]?.apower;
+  return { kwh: null, minW: p ?? null, avgW: p ?? null, maxW: p ?? null, peakAt: null };
+}
+
+async function readViaEMData(ip, t0, t1){
+  const params = `id=0&ts=${t0}&end_ts=${t1}`;
+  const r = await fetch(`http://${ip}/rpc/EMData.GetData?${params}`);
+  if (!r.ok) throw new Error("EMData.GetData falhou");
+  const js = await r.json();
+  const {keys, data} = js;
+  if (!keys || !data?.length) return {kwh:null,minW:null,avgW:null,maxW:null,peakAt:null};
+
+  const idx = k => keys.indexOf(k);
+  const phases = ["a","b","c"];
+  let kwh = 0, maxW = null, minW = null, peakAt = null;
+
+  const row = data[0];
+  const period = row.period || 60;
+  const vals = row.values;
+
+  for (let i=0;i<vals.length;i++){
+    const v = vals[i];
+    let pMax = 0, pMin = 0;
+    phases.forEach(ph=>{
+      const iMax = idx(`${ph}_max_act_power`);
+      const iMin = idx(`${ph}_min_act_power`);
+      pMax += (iMax>=0 && typeof v[iMax]==="number") ? v[iMax] : 0;
+      pMin += (iMin>=0 && typeof v[iMin]==="number") ? v[iMin] : 0;
+    });
+    if (maxW==null || pMax>maxW){ maxW=pMax; peakAt=new Date((t0+i*period)*1000).toTimeString().slice(0,5); }
+    if (minW==null || pMin<minW){ minW=pMin; }
+  }
+
+  phases.forEach(ph=>{
+    const iE = idx(`${ph}_total_act_energy`);
+    if (iE>=0){
+      const seq = vals.map(r => r[iE]).filter(x=>typeof x==="number");
+      if (seq.length>=2) kwh += (Math.max(...seq) - Math.min(...seq))/1000;
+    }
+  });
+
+  const avgW = (kwh!=null) ? Math.round((kwh*1000)/24) : null;
+  return { kwh:+kwh.toFixed(3), minW, avgW, maxW, peakAt };
+}
+
+async function readViaEM1Data(ip, t0, t1){
+  const st = await (await fetch(`http://${ip}/rpc/Shelly.GetStatus`)).json();
+  const ids = Object.keys(st).filter(k=>k.startsWith("em1data:")).map(k=>parseInt(k.split(":")[1],10)).filter(Number.isFinite);
+  if (!ids.length) throw new Error("Sem EM1Data");
+
+  let totalKwh = 0, maxW = null, minW = null, peakAt = null;
+  for (const id of ids){
+    const r = await fetch(`http://${ip}/rpc/EM1Data.GetData?id=${id}&ts=${t0}&end_ts=${t1}`);
+    if (!r.ok) continue;
+    const js = await r.json();
+    const {keys, data} = js; if (!keys || !data?.length) continue;
+    const idx = k => keys.indexOf(k);
+    const row = data[0]; const period = row.period || 60; const vals = row.values;
+    const iE = idx("total_act_energy");
+    if (iE>=0){ const seq = vals.map(v => v[iE]).filter(n=>typeof n==="number"); if (seq.length>=2) totalKwh += (Math.max(...seq)-Math.min(...seq))/1000; }
+    const iMax = idx("max_act_power"), iMin = idx("min_act_power");
+    for (let i=0;i<vals.length;i++){
+      const vmax = iMax>=0 ? vals[i][iMax] : null;
+      const vmin = iMin>=0 ? vals[i][iMin] : null;
+      if (typeof vmax==="number"){ if (maxW==null || vmax>maxW){ maxW=vmax; peakAt=new Date((t0+i*period)*1000).toTimeString().slice(0,5); } }
+      if (typeof vmin==="number"){ if (minW==null || vmin<minW){ minW=vmin; } }
+    }
+  }
+  const avgW = (totalKwh!=null) ? Math.round((totalKwh*1000)/24) : null;
+  return { kwh:+totalKwh.toFixed(3), minW, avgW, maxW, peakAt };
+}
+
+function demoDay(dateISO){
+  const seed = new Date(dateISO).getTime()/86400000;
+  const kwh = 4 + 1.2*Math.sin(seed*0.9) + Math.random()*0.3;
+  const maxW = Math.round(500 + 300*Math.abs(Math.sin(seed*1.7)));
+  const avgW = Math.round((kwh*1000)/24), minW = Math.round(avgW*0.2);
+  const peakAt = ["12:15","18:40","20:10","07:55"][Math.floor(seed)%4];
+  return {kwh:+kwh.toFixed(3), minW, avgW, maxW, peakAt};
+}
+
+function loadFactor(kwh,maxW){ if(!kwh||!maxW) return null; return (kwh*1000)/(maxW*24); }
+
+let chartDaily, chartWeekly;
+function render(){
+  $("#appVersion").textContent = APP_VERSION;
+  $("#todayLabel").textContent = isoToday();
+  const db = loadDb();
+  const t = db[isoToday()]||{};
+  $("#kpiKwh").textContent = (t.kwh!=null)? `${t.kwh.toFixed?.(3)||t.kwh} kWh` : "— kWh";
+  $("#kpiPico").textContent = (t.maxW!=null)? `${t.maxW} W ${t.peakAt?`(${t.peakAt})`:""}` : "— W";
+  $("#kpiAvg").textContent  = (t.avgW!=null)? `${t.avgW} W` : "— W";
+  const lf = loadFactor(t.kwh,t.maxW);
+  $("#kpiLF").textContent = (lf!=null)? `${(lf*100).toFixed(1)}%` : "—";
+
+  const dates = Object.keys(db).sort();
+  const last60 = dates.slice(-60);
+  const daily = last60.map(d=> db[d]?.kwh ?? null);
+  const mm7   = last60.map((_,i)=>{ const s=daily.slice(Math.max(0,i-6),i+1).filter(x=>x!=null); return s.length? +(s.reduce((a,b)=>a+b,0)/s.length).toFixed(3): null; });
+
+  if (chartDaily) chartDaily.destroy();
+  chartDaily = new Chart(document.getElementById("chartDaily"), {
+    type:"line",
+    data:{labels:last60,datasets:[
+      {label:"kWh/dia", data:daily, spanGaps:true},
+      {label:"Média móvel 7d", data:mm7, spanGaps:true, borderDash:[6,6]}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,scales:{y:{beginAtZero:true}}}
+  });
+
+  const weekMap = new Map();
+  for(const d of dates){
+    const v=db[d]?.kwh; if(v==null) continue;
+    const dt=new Date(d+"T00:00:00"); const day=(dt.getDay()+6)%7;
+    const thu=new Date(dt); thu.setDate(dt.getDate()-day+3);
+    const week1 = new Date(thu.getFullYear(),0,4);
+    const w=1+Math.round(((thu-week1)/86400000-3)/7);
+    const key=`${thu.getFullYear()}-W${String(w).padStart(2,"0")}`;
+    weekMap.set(key,(weekMap.get(key)||0)+v);
+  }
+  const weeks=[...weekMap.keys()].sort().slice(-26);
+  const wkVals=weeks.map(k=>+weekMap.get(k).toFixed(3));
+
+  if (chartWeekly) chartWeekly.destroy();
+  chartWeekly = new Chart(document.getElementById("chartWeekly"), {
+    type:"bar",
+    data:{labels:weeks,datasets:[{label:"kWh/semana", data:wkVals}]},
+    options:{responsive:true,maintainAspectRatio:false,scales:{y:{beginAtZero:true}}}
+  });
+
+  const hist = document.getElementById("history"); hist.innerHTML="";
+  const datesDesc = dates.slice().reverse();
+  datesDesc.forEach(d=>{
+    const r=db[d];
+    const div=document.createElement("div");
+    div.className="row";
+    div.innerHTML = `
+      <div><strong>${d}</strong></div>
+      <div>kWh: <strong>${r.kwh!=null ? (r.kwh.toFixed?.(3)||r.kwh) : "—"}</strong></div>
+      <div>W [min/méd/máx]: ${r.minW??"—"} / ${r.avgW??"—"} / ${r.maxW??"—"}</div>
+      <div>${r.peakAt?`Pico: ${r.peakAt}`:""}</div>`;
+    hist.appendChild(div);
+  });
+}
+
+function bind(){
+  uiFromCfg(); render();
+  $("#mode").onchange=()=>{const c=loadCfg(); c.mode=$("#mode").value; saveCfg(c); uiFromCfg();};
+  $("#saveCfg").onclick=()=>{const c=loadCfg(); c.mode=$("#mode").value; c.cloudUrl=$("#cloudUrl").value.trim(); c.shellyIp=$("#shellyIp").value.trim(); saveCfg(c); uiFromCfg();};
+  $("#pullToday").onclick=()=>pullDay(isoToday()).catch(e=>alert(e.message));
+  $("#markDone").onclick=()=>{const db=loadDb(); const t=isoToday(); db[t]=Object.assign(db[t]||{}, {done:true}); saveDb(db); render();};
+  $("#reset").onclick=()=>{ if(confirm("Apagar configuração e histórico?")){ localStorage.removeItem(LS_KEY_CFG); localStorage.removeItem(LS_KEY_DATA); location.reload(); } };
+  $("#appVersion").textContent = APP_VERSION;
+  $("#todayLabel").textContent = isoToday();
+}
+document.addEventListener("DOMContentLoaded", bind);
+</script>
+</body>
+</html>
 
